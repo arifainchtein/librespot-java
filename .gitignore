@@ -4,3 +4,4 @@ target/
 *iml
 conf.json
 /cache/
+conf.properties

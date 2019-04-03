@@ -51,7 +51,12 @@ public class TrackHandler implements PlayerRunner.Listener, Closeable {
         if (stopped) return;
 
         LOGGER.info(String.format("Loaded track, name: '%s', artists: '%s', gid: %s", track.getName(), Utils.artistsToString(track.getArtistList()), Utils.bytesToHex(id.getGid())));
-
+        JsonObject data = new JsonObject();
+        data.addProperty("Name", track.getName());
+        data.addProperty("Artist", Utils.artistsToString(track.getArtistList()));
+        data.addProperty("Album", track.getAlbum().getName());
+        
+        FileUtils.writeStringToFile(new File("CurrentSong.txt"), data.toString());
         try {
             if (playerRunner != null) playerRunner.stop();
             playerRunner = new PlayerRunner(stream.in, stream.normalizationData, lines, conf, this, track.getDuration());

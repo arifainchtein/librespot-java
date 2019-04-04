@@ -8,7 +8,12 @@ import xyz.gianlu.librespot.common.Utils;
 import xyz.gianlu.librespot.common.proto.Metadata;
 import xyz.gianlu.librespot.core.Session;
 import xyz.gianlu.librespot.mercury.MercuryClient;
+import xyz.gianlu.librespot.mercury.model.EpisodeId;
+import xyz.gianlu.librespot.mercury.model.PlayableId;
 import xyz.gianlu.librespot.mercury.model.TrackId;
+import xyz.gianlu.librespot.player.codecs.Codec;
+import xyz.gianlu.librespot.player.codecs.VorbisOnlyAudioQuality;
+import xyz.gianlu.librespot.player.feeders.BaseFeeder;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -26,9 +31,10 @@ public class TrackHandler implements PlayerRunner.Listener, Closeable {
     private final LinesHolder lines;
     private final Player.Configuration conf;
     private final Listener listener;
-    private final StreamFeeder feeder;
-    private PlayerRunner playerRunner;
+    private BaseFeeder feeder;
     private Metadata.Track track;
+    private Metadata.Episode episode;
+    private PlayerRunner playerRunner;
     private volatile boolean stopped = false;
 
     TrackHandler(@NotNull Session session, @NotNull LinesHolder lines, @NotNull Player.Configuration conf, @NotNull Listener listener) {
@@ -36,17 +42,24 @@ public class TrackHandler implements PlayerRunner.Listener, Closeable {
         this.lines = lines;
         this.conf = conf;
         this.listener = listener;
-        this.feeder = new StreamFeeder(session);
 
         Looper looper;
         new Thread(looper = new Looper(), "track-handler-" + looper.hashCode()).start();
     }
 
-    private void load(@NotNull TrackId id, boolean play, int pos) throws IOException, MercuryClient.MercuryException, CdnManager.CdnException {
+    @NotNull
+    private PlayerRunner createRunner(@NotNull BaseFeeder.LoadedStream stream) throws Codec.CodecException, IOException, LinesHolder.MixerException {
+        return new PlayerRunner(stream.in, stream.normalizationData, lines, conf, this, track == null ? episode.getDuration() : track.getDuration());
+    }
+
+    private void load(@NotNull PlayableId id, boolean play, int pos) throws IOException, MercuryClient.MercuryException, CdnManager.CdnException, ContentRestrictedException {
+        if (feeder == null) feeder = BaseFeeder.feederFor(session, id, conf);
+
         listener.startedLoading(this);
 
-        StreamFeeder.LoadedStream stream = feeder.load(id, new StreamFeeder.VorbisOnlyAudioQuality(conf.preferredQuality()), conf.useCdn());
+        BaseFeeder.LoadedStream stream = feeder.load(id, new VorbisOnlyAudioQuality(conf.preferredQuality()));
         track = stream.track;
+        episode = stream.episode;
 
         if (stopped) return;
 
@@ -57,9 +70,18 @@ public class TrackHandler implements PlayerRunner.Listener, Closeable {
         data.addProperty("Album", track.getAlbum().getName());
         
         FileUtils.writeStringToFile(new File("CurrentSong.txt"), data.toString());
+        if (id instanceof EpisodeId)
+            LOGGER.info(String.format("Loaded episode, name: '%s', gid: %s", episode.getName(), Utils.bytesToHex(id.getGid())));
+        else if (id instanceof TrackId)
+            LOGGER.info(String.format("Loaded track, name: '%s', artists: '%s', gid: %s", track.getName(), Utils.artistsToString(track.getArtistList()), Utils.bytesToHex(id.getGid())));
+
+        loadRunner(id, stream, play, pos);
+    }
+
+    private void loadRunner(@NotNull PlayableId id, @NotNull BaseFeeder.LoadedStream stream, boolean play, int pos) throws IOException {
         try {
             if (playerRunner != null) playerRunner.stop();
-            playerRunner = new PlayerRunner(stream.in, stream.normalizationData, lines, conf, this, track.getDuration());
+            playerRunner = createRunner(stream);
             new Thread(playerRunner, "player-runner-" + playerRunner.hashCode()).start();
 
             playerRunner.seek(pos);
@@ -67,7 +89,7 @@ public class TrackHandler implements PlayerRunner.Listener, Closeable {
             listener.finishedLoading(this, pos, play);
 
             if (play) playerRunner.play();
-        } catch (PlayerRunner.PlayerException ex) {
+        } catch (LinesHolder.MixerException | Codec.CodecException ex) {
             listener.loadingError(this, id, ex);
         }
 
@@ -99,7 +121,7 @@ public class TrackHandler implements PlayerRunner.Listener, Closeable {
         return stopped;
     }
 
-    void sendLoad(@NotNull TrackId track, boolean play, int pos) {
+    void sendLoad(@NotNull PlayableId track, boolean play, int pos) {
         sendCommand(Command.Load, track, play, pos);
     }
 
@@ -135,17 +157,19 @@ public class TrackHandler implements PlayerRunner.Listener, Closeable {
         commands.add(new CommandBundle(Command.Terminate));
     }
 
+    boolean isTrack(@NotNull PlayableId id) {
+        return (track != null && track.hasGid() && Arrays.equals(id.getGid(), track.getGid().toByteArray()))
+                || (episode != null && episode.hasGid() && Arrays.equals(id.getGid(), episode.getGid().toByteArray()));
+    }
+
     @Nullable
     public Metadata.Track track() {
         return track;
     }
 
-    boolean isTrack(@NotNull TrackId id) {
-        return track != null && track.hasGid() && Arrays.equals(id.getGid(), track.getGid().toByteArray());
-    }
-
-    public int getPosition() {
-        return playerRunner == null ? 0 : playerRunner.time();
+    @Nullable
+    public Metadata.Episode episode() {
+        return episode;
     }
 
     public enum Command {
@@ -158,7 +182,7 @@ public class TrackHandler implements PlayerRunner.Listener, Closeable {
 
         void finishedLoading(@NotNull TrackHandler handler, int pos, boolean play);
 
-        void loadingError(@NotNull TrackHandler handler, @NotNull TrackId track, @NotNull Exception ex);
+        void loadingError(@NotNull TrackHandler handler, @NotNull PlayableId track, @NotNull Exception ex);
 
         void endOfTrack(@NotNull TrackHandler handler);
 
@@ -174,11 +198,11 @@ public class TrackHandler implements PlayerRunner.Listener, Closeable {
                     CommandBundle cmd = commands.take();
                     switch (cmd.cmd) {
                         case Load:
-                            TrackId id = (TrackId) cmd.args[0];
+                            PlayableId id = (PlayableId) cmd.args[0];
 
                             try {
                                 load(id, (Boolean) cmd.args[1], (Integer) cmd.args[2]);
-                            } catch (IOException | MercuryClient.MercuryException | CdnManager.CdnException ex) {
+                            } catch (IOException | MercuryClient.MercuryException | CdnManager.CdnException | ContentRestrictedException ex) {
                                 listener.loadingError(TrackHandler.this, id, ex);
                             }
                             break;

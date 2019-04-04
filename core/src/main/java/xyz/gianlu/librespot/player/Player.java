@@ -6,15 +6,20 @@ import org.apache.log4j.Logger;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import xyz.gianlu.librespot.common.Utils;
+import xyz.gianlu.librespot.common.proto.Metadata;
 import xyz.gianlu.librespot.common.proto.Spirc;
 import xyz.gianlu.librespot.core.Session;
 import xyz.gianlu.librespot.core.TimeProvider;
 import xyz.gianlu.librespot.mercury.MercuryClient;
 import xyz.gianlu.librespot.mercury.MercuryRequests;
+import xyz.gianlu.librespot.mercury.model.EpisodeId;
+import xyz.gianlu.librespot.mercury.model.PlayableId;
 import xyz.gianlu.librespot.mercury.model.TrackId;
+import xyz.gianlu.librespot.player.codecs.AudioQuality;
 import xyz.gianlu.librespot.player.remote.Remote3Frame;
 import xyz.gianlu.librespot.player.remote.Remote3Track;
 import xyz.gianlu.librespot.player.tracks.PlaylistProvider;
+import xyz.gianlu.librespot.player.tracks.ShowProvider;
 import xyz.gianlu.librespot.player.tracks.StationProvider;
 import xyz.gianlu.librespot.player.tracks.TracksProvider;
 import xyz.gianlu.librespot.spirc.FrameListener;
@@ -243,14 +248,14 @@ public class Player implements FrameListener, TrackHandler.Listener, Closeable {
     }
 
     private void shuffleTracks(boolean fully) {
-        if (tracksProvider instanceof PlaylistProvider)
+        if (tracksProvider.canShuffle() && tracksProvider instanceof PlaylistProvider)
             ((PlaylistProvider) tracksProvider).shuffleTracks(session.random(), fully);
         else
             LOGGER.warn("Cannot shuffle TracksProvider: " + tracksProvider);
     }
 
     private void unshuffleTracks() {
-        if (tracksProvider instanceof PlaylistProvider)
+        if (tracksProvider.canShuffle() && tracksProvider instanceof PlaylistProvider)
             ((PlaylistProvider) tracksProvider).unshuffleTracks();
         else
             LOGGER.warn("Cannot unshuffle TracksProvider: " + tracksProvider);
@@ -270,6 +275,8 @@ public class Player implements FrameListener, TrackHandler.Listener, Closeable {
             String context = frame.context.uri;
             if (context.startsWith("spotify:station:") || context.startsWith("spotify:dailymix:"))
                 tracksProvider = new StationProvider(session, state.state);
+            else if (context.startsWith("spotify:show:"))
+                tracksProvider = new ShowProvider(state.state);
             else
                 tracksProvider = new PlaylistProvider(session, state.state, conf);
         }
@@ -279,7 +286,7 @@ public class Player implements FrameListener, TrackHandler.Listener, Closeable {
             Optional.ofNullable(frame.options.playerOptionsOverride.shufflingContext).ifPresent(state::setShuffle);
         }
 
-        if (state.getShuffle())
+        if (state.getShuffle() && frame.endpoint != Remote3Frame.Endpoint.UpdateContext)
             shuffleTracks(frame.options == null || frame.options.skipTo.trackUid == null);
     }
 
@@ -307,8 +314,14 @@ public class Player implements FrameListener, TrackHandler.Listener, Closeable {
     }
 
     @Override
-    public void loadingError(@NotNull TrackHandler handler, @NotNull TrackId id, @NotNull Exception ex) {
+    public void loadingError(@NotNull TrackHandler handler, @NotNull PlayableId id, @NotNull Exception ex) {
         if (handler == trackHandler) {
+            if (ex instanceof ContentRestrictedException) {
+                LOGGER.fatal(String.format("Can't load track (content restricted), gid: %s", Utils.bytesToHex(id.getGid())), ex);
+                handleNext();
+                return;
+            }
+
             LOGGER.fatal(String.format("Failed loading track, gid: %s", Utils.bytesToHex(id.getGid())), ex);
             state.setStatus(Spirc.PlayStatus.kPlayStatusStop);
             stateUpdated();
@@ -339,7 +352,7 @@ public class Player implements FrameListener, TrackHandler.Listener, Closeable {
         if (handler == trackHandler) {
             int index = tracksProvider.getNextTrackIndex(false);
             if (index < state.getTrackCount()) {
-                TrackId next = tracksProvider.getTrackAt(index);
+                PlayableId next = tracksProvider.getTrackAt(index);
                 preloadTrackHandler = new TrackHandler(session, lines, conf, this);
                 preloadTrackHandler.sendLoad(next, false, 0);
                 LOGGER.trace("Started next track preload, gid: " + Utils.bytesToHex(next.getGid()));
@@ -371,7 +384,7 @@ public class Player implements FrameListener, TrackHandler.Listener, Closeable {
     private void loadTrack(boolean play) {
         if (trackHandler != null) trackHandler.close();
 
-        TrackId id = tracksProvider.getCurrentTrack();
+        PlayableId id = tracksProvider.getCurrentTrack();
         if (preloadTrackHandler != null && preloadTrackHandler.isTrack(id)) {
             trackHandler = preloadTrackHandler;
             preloadTrackHandler = null;
@@ -396,7 +409,6 @@ public class Player implements FrameListener, TrackHandler.Listener, Closeable {
             state.setStatus(Spirc.PlayStatus.kPlayStatusPlay);
             if (trackHandler != null) {
                 trackHandler.sendPlay();
-                state.setPositionMs(trackHandler.getPosition());
                 state.setPositionMeasuredAt(TimeProvider.currentTimeMillis());
             }
 
@@ -472,7 +484,7 @@ public class Player implements FrameListener, TrackHandler.Listener, Closeable {
 
     private void handlePrev() {
         if (getPosition() < 3000) {
-            state.setPlayingTrackIndex(tracksProvider.getPrevTrackIndex(true));
+            state.setPlayingTrackIndex(tracksProvider.getPrevTrackIndex());
             state.setPositionMs(0);
             state.setPositionMeasuredAt(TimeProvider.currentTimeMillis());
 
@@ -498,9 +510,24 @@ public class Player implements FrameListener, TrackHandler.Listener, Closeable {
         }
     }
 
+    @Nullable
+    public Metadata.Track currentTrack() {
+        return trackHandler.track();
+    }
+
+    @Nullable
+    public Metadata.Episode currentEpisode() {
+        return trackHandler.episode();
+    }
+
+    @Nullable
+    public PlayableId currentPlayableId() {
+        return tracksProvider == null ? null : tracksProvider.getCurrentTrack();
+    }
+
     public interface Configuration {
         @NotNull
-        StreamFeeder.AudioQuality preferredQuality();
+        AudioQuality preferredQuality();
 
         boolean preloadEnabled();
 
@@ -517,7 +544,9 @@ public class Player implements FrameListener, TrackHandler.Listener, Closeable {
 
         boolean autoplayEnabled();
 
-        boolean useCdn();
+        boolean useCdnForTracks();
+
+        boolean useCdnForEpisodes();
     }
 
     private class StateWrapper {
@@ -583,7 +612,19 @@ public class Player implements FrameListener, TrackHandler.Listener, Closeable {
             if (frame.context == null)
                 throw new IllegalArgumentException("Invalid frame received!");
 
-            TrackId oldPlaying = state.getTrackCount() > 0 ? TrackId.fromTrackRef(state.getTrack(state.getPlayingTrackIndex())) : null;
+            String oldPlayingUri = null;
+            if (state.getTrackCount() > 0) {
+                Spirc.TrackRef playingTrack = state.getTrack(state.getPlayingTrackIndex());
+
+                if (playingTrack.hasUri()) {
+                    oldPlayingUri = playingTrack.getUri();
+                } else if (playingTrack.hasGid()) {
+                    if (frame.context.uri.startsWith("spotify:show:"))
+                        oldPlayingUri = EpisodeId.fromTrackRef(playingTrack).toSpotifyUri();
+                    else
+                        oldPlayingUri = TrackId.fromTrackRef(playingTrack).toSpotifyUri();
+                }
+            }
 
             state.setContextUri(frame.context.uri);
             state.clearTrack();
@@ -597,7 +638,7 @@ public class Player implements FrameListener, TrackHandler.Listener, Closeable {
                 }
 
                 if (pageIndex == -1) pageIndex = 0;
-                if (trackUid == null && oldPlaying != null) trackUid = oldPlaying.toSpotifyUri();
+                if (trackUid == null) trackUid = oldPlayingUri;
 
                 int index = -1;
                 List<Remote3Track> tracks = frame.context.pages.get(pageIndex).tracks;

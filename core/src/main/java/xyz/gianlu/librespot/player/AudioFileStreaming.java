@@ -8,6 +8,9 @@ import xyz.gianlu.librespot.common.NameThreadFactory;
 import xyz.gianlu.librespot.common.Utils;
 import xyz.gianlu.librespot.common.proto.Metadata;
 import xyz.gianlu.librespot.core.Session;
+import xyz.gianlu.librespot.player.codecs.SuperAudioFormat;
+import xyz.gianlu.librespot.player.decrypt.AesAudioDecrypt;
+import xyz.gianlu.librespot.player.decrypt.AudioDecrypt;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -32,7 +35,7 @@ public class AudioFileStreaming implements AudioFile, GeneralAudioStream {
     private int chunks = -1;
     private ChunksBuffer chunksBuffer;
 
-    AudioFileStreaming(@NotNull Session session, @NotNull Metadata.AudioFile file, byte[] key) throws IOException {
+    public AudioFileStreaming(@NotNull Session session, @NotNull Metadata.AudioFile file, byte[] key) throws IOException {
         this.session = session;
         this.fileId = file.getFileId();
         this.cacheHandler = session.cache().forFileId(fileId);
@@ -43,6 +46,11 @@ public class AudioFileStreaming implements AudioFile, GeneralAudioStream {
     @Override
     public String getFileIdHex() {
         return Utils.bytesToHex(fileId);
+    }
+
+    @Override
+    public @NotNull SuperAudioFormat codec() {
+        return SuperAudioFormat.VORBIS;
     }
 
     @NotNull
@@ -91,7 +99,7 @@ public class AudioFileStreaming implements AudioFile, GeneralAudioStream {
         return fetch;
     }
 
-    void open() throws IOException {
+    public void open() throws IOException {
         AudioFileFetch fetch = requestHeaders();
 
         int size = fetch.getSize();
@@ -154,7 +162,7 @@ public class AudioFileStreaming implements AudioFile, GeneralAudioStream {
             this.buffer[chunks - 1] = new byte[size % CHUNK_SIZE];
             this.available = new boolean[chunks];
             this.requested = new boolean[chunks];
-            this.audioDecrypt = new AudioDecrypt(key);
+            this.audioDecrypt = new AesAudioDecrypt(key);
             this.internalStream = new InternalStream();
         }
 

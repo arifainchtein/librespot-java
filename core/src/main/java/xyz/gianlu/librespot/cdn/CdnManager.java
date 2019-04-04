@@ -1,22 +1,30 @@
 package xyz.gianlu.librespot.cdn;
 
 import com.google.protobuf.ByteString;
+import okhttp3.*;
 import org.apache.log4j.Logger;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import xyz.gianlu.librespot.cache.CacheManager;
-import xyz.gianlu.librespot.common.NetUtils;
 import xyz.gianlu.librespot.common.Utils;
+import xyz.gianlu.librespot.common.proto.Metadata;
 import xyz.gianlu.librespot.core.Session;
 import xyz.gianlu.librespot.mercury.MercuryClient;
-import xyz.gianlu.librespot.player.*;
+import xyz.gianlu.librespot.player.AbsChunckedInputStream;
+import xyz.gianlu.librespot.player.AudioFileFetch;
+import xyz.gianlu.librespot.player.GeneralAudioStream;
+import xyz.gianlu.librespot.player.GeneralWritableStream;
+import xyz.gianlu.librespot.player.codecs.SuperAudioFormat;
+import xyz.gianlu.librespot.player.decrypt.AesAudioDecrypt;
+import xyz.gianlu.librespot.player.decrypt.AudioDecrypt;
+import xyz.gianlu.librespot.player.decrypt.NoopAudioDecrypt;
 
-import java.io.*;
-import java.net.*;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.sql.SQLException;
-import java.util.Map;
-import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -29,102 +37,101 @@ public class CdnManager {
     private static final String STORAGE_RESOLVE_AUDIO_URL = "https://spclient.wg.spotify.com/storage-resolve/files/audio/interactive/%s";
     private static final Logger LOGGER = Logger.getLogger(CdnManager.class);
     private final Session session;
+    private final OkHttpClient client;
 
     public CdnManager(@NotNull Session session) {
         this.session = session;
+        this.client = new OkHttpClient();
+    }
+
+    @NotNull
+    public OkHttpClient client() {
+        return client;
     }
 
     @NotNull
     private InputStream getHead(@NotNull ByteString fileId) throws IOException {
-        Socket socket = new Socket();
-        socket.connect(new InetSocketAddress("heads-fa.spotify.com", 80));
+        Response resp = client.newCall(new Request.Builder()
+                .get().url("https://heads-fa.spotify.com/head/" + Utils.bytesToHex(fileId).toLowerCase())
+                .build()).execute();
 
-        OutputStream out = socket.getOutputStream();
-        out.write("GET ".getBytes());
-        out.write("/head/".getBytes());
-        out.write(Utils.bytesToHex(fileId).toLowerCase().getBytes());
-        out.write(" HTTP/1.1".getBytes());
-        out.write("\r\nHost: heads-fa.spotify.com".getBytes());
-        out.write("\r\n\r\n".getBytes());
-        out.flush();
+        if (resp.code() != 200)
+            throw new IOException(resp.code() + ": " + resp.message());
 
-        InputStream in = socket.getInputStream();
-        NetUtils.StatusLine sl = NetUtils.parseStatusLine(Utils.readLine(in));
-        if (sl.statusCode != 200)
-            throw new IOException(sl.statusCode + ": " + sl.statusPhrase);
+        ResponseBody body = resp.body();
+        if (body == null)
+            throw new IOException("Response body is empty!");
 
-        Map<String, String> headers = NetUtils.parseHeaders(in);
-        LOGGER.debug(String.format("Headers for %s: %s", Utils.bytesToHex(fileId), headers));
-        return in;
+        return body.byteStream();
     }
 
     @NotNull
-    public Streamer stream(@NotNull ByteString fileId, @NotNull byte[] key) throws IOException, MercuryClient.MercuryException, CdnException {
-        AudioUrl moreAudio = getAudioUrl(fileId);
-        return new Streamer(fileId, key, moreAudio, session.cache());
+    public Streamer streamEpisode(@NotNull HttpUrl externalUrl) throws IOException {
+        return new Streamer(AudioFileSurrogate.from(externalUrl), externalUrl, session.cache(), new NoopAudioDecrypt());
     }
 
     @NotNull
-    private AudioUrl getAudioUrl(@NotNull ByteString fileId) throws IOException, MercuryClient.MercuryException, CdnException {
-        HttpURLConnection conn = (HttpURLConnection) new URL(String.format(STORAGE_RESOLVE_AUDIO_URL, Utils.bytesToHex(fileId))).openConnection();
-        conn.addRequestProperty("Authorization", "Bearer " + session.tokens().get("playlist-read"));
-        conn.connect();
+    public Streamer streamTrack(@NotNull Metadata.AudioFile file, @NotNull byte[] key) throws IOException, MercuryClient.MercuryException, CdnException {
+        return new Streamer(AudioFileSurrogate.from(file), getAudioUrl(file.getFileId()), session.cache(), new AesAudioDecrypt(key));
+    }
 
-        try {
-            byte[] protoBytes;
-            try (InputStream in = conn.getInputStream();
-                 ByteArrayOutputStream bytesOut = new ByteArrayOutputStream()) {
-                int count;
-                byte[] buffer = new byte[4096];
-                while ((count = in.read(buffer)) != -1)
-                    bytesOut.write(buffer, 0, count);
+    @NotNull
+    private HttpUrl getAudioUrl(@NotNull ByteString fileId) throws IOException, MercuryClient.MercuryException, CdnException {
+        try (Response resp = client.newCall(new Request.Builder().get()
+                .header("Authorization", "Bearer " + session.tokens().get("playlist-read"))
+                .url(String.format(STORAGE_RESOLVE_AUDIO_URL, Utils.bytesToHex(fileId)))
+                .build()).execute()) {
 
-                protoBytes = bytesOut.toByteArray();
-            }
+            if (resp.code() != 200)
+                throw new IOException(resp.code() + ": " + resp.message());
 
-            StorageResolve.StorageResolveResponse proto = StorageResolve.StorageResolveResponse.parseFrom(protoBytes);
+            ResponseBody body = resp.body();
+            if (body == null)
+                throw new IOException("Response body is empty!");
+
+            StorageResolve.StorageResolveResponse proto = StorageResolve.StorageResolveResponse.parseFrom(body.byteStream());
             if (proto.getResult() == StorageResolve.StorageResolveResponse.Result.CDN) {
-                return new AudioUrl(proto.getCdnurl(session.random().nextInt(proto.getCdnurlCount())));
+                return HttpUrl.get(proto.getCdnurl(session.random().nextInt(proto.getCdnurlCount())));
             } else {
                 throw new CdnException(String.format("Could not retrieve CDN url! {result: %s}", proto.getResult()));
             }
-        } finally {
-            conn.disconnect();
         }
     }
 
-    private static class AudioUrl {
-        private final String host;
-        private final String path;
-        private final int port;
+    private static class AudioFileSurrogate {
+        private final String fileId;
+        private final SuperAudioFormat format;
 
-        private AudioUrl(@NotNull String str) throws MalformedURLException {
-            URL url = new URL(str);
-
-            this.host = url.getHost();
-            this.port = url.getPort() == -1 ? url.getDefaultPort() : url.getPort();
-            this.path = url.getPath() + "?" + url.getQuery();
+        AudioFileSurrogate(@NotNull String fileId, @NotNull SuperAudioFormat format) {
+            this.fileId = fileId;
+            this.format = format;
         }
 
         @NotNull
-        private Socket createSocket() throws IOException {
-            Socket socket = new Socket();
-            socket.connect(new InetSocketAddress(host, port));
-            return socket;
+        static AudioFileSurrogate from(@NotNull Metadata.AudioFile file) {
+            return new AudioFileSurrogate(Utils.bytesToHex(file.getFileId()), SuperAudioFormat.get(file.getFormat()));
         }
 
-        private void sendRequest(@NotNull OutputStream out, int rangeStart, int rangeEnd) throws IOException {
-            out.write("GET ".getBytes());
-            out.write(path.getBytes());
-            out.write(" HTTP/1.1".getBytes());
-            out.write("\r\nHost: ".getBytes());
-            out.write(host.getBytes());
-            out.write("\r\nRange: bytes=".getBytes());
-            out.write(String.valueOf(rangeStart).getBytes());
-            out.write("-".getBytes());
-            out.write(String.valueOf(rangeEnd).getBytes());
-            out.write("\r\n\r\n".getBytes());
-            out.flush();
+        @NotNull
+        static AudioFileSurrogate from(@NotNull HttpUrl url) {
+            // Generating fake file id!
+
+            try {
+                byte[] hash = MessageDigest.getInstance("SHA1").digest(url.toString().getBytes());
+                return new AudioFileSurrogate(Utils.bytesToHex(hash, 0, 20), SuperAudioFormat.MP3);
+            } catch (NoSuchAlgorithmException ex) {
+                throw new RuntimeException(ex);
+            }
+        }
+
+        @NotNull
+        SuperAudioFormat getFormat() {
+            return format;
+        }
+
+        @NotNull
+        String getFileId() {
+            return fileId;
         }
     }
 
@@ -135,33 +142,43 @@ public class CdnManager {
         }
     }
 
-    public static class Streamer implements GeneralAudioStream, GeneralWritableStream {
-        private final ByteString fileId;
+    private static class InternalResponse {
+        private final byte[] buffer;
+        private final Headers headers;
+
+        InternalResponse(byte[] buffer, Headers headers) {
+            this.buffer = buffer;
+            this.headers = headers;
+        }
+    }
+
+    public class Streamer implements GeneralAudioStream, GeneralWritableStream {
+        private final AudioFileSurrogate file;
         private final ExecutorService executorService = Executors.newCachedThreadPool();
         private final AudioDecrypt audioDecrypt;
+        private final HttpUrl cdnUrl;
         private final int size;
         private final byte[][] buffer;
         private final boolean[] available;
         private final boolean[] requested;
-        private final CdnLoader loader;
         private final int chunks;
         private final InternalStream internalStream;
         private final CacheManager.Handler cacheHandler;
 
-        private Streamer(@NotNull ByteString fileId, byte[] key, @NotNull AudioUrl moreAudio, @Nullable CacheManager cache) throws IOException, CdnException {
-            this.fileId = fileId;
-            this.audioDecrypt = new AudioDecrypt(key);
-            this.loader = new CdnLoader(moreAudio);
-            this.cacheHandler = cache != null ? cache.forFileId(fileId) : null;
+        private Streamer(@NotNull AudioFileSurrogate file, @NotNull HttpUrl cdnUrl, @Nullable CacheManager cache, @Nullable AudioDecrypt audioDecrypt) throws IOException {
+            this.file = file;
+            this.audioDecrypt = audioDecrypt;
+            this.cdnUrl = cdnUrl;
+            this.cacheHandler = cache != null ? cache.forFileId(file.getFileId()) : null;
 
             byte[] firstChunk;
             try {
                 byte[] sizeHeader;
                 if (cacheHandler == null || (sizeHeader = cacheHandler.getHeader(AudioFileFetch.HEADER_SIZE)) == null) {
-                    CdnLoader.Response resp = loader.request(0, CHUNK_SIZE - 1, false);
+                    InternalResponse resp = request(0, CHUNK_SIZE - 1);
                     String contentRange = resp.headers.get("Content-Range");
                     if (contentRange == null)
-                        throw new CdnException("Missing Content-Range header!");
+                        throw new IOException("Missing Content-Range header!");
 
                     String[] split = Utils.split(contentRange, '/');
                     size = Integer.parseInt(split[1]);
@@ -203,7 +220,7 @@ public class CdnManager {
                 }
             }
 
-            LOGGER.trace(String.format("Chunk %d/%d completed, cdn: %s, cached: %b, fileId: %s", chunkIndex, chunks, loader.moreAudio.host, cached, Utils.bytesToHex(fileId)));
+            LOGGER.trace(String.format("Chunk %d/%d completed, cdn: %s, cached: %b, fileId: %s", chunkIndex, chunks, cdnUrl.host(), cached, file.getFileId()));
 
             audioDecrypt.decryptChunk(chunkIndex, chunk, buffer[chunkIndex]);
             internalStream.notifyChunkAvailable(chunkIndex);
@@ -216,7 +233,12 @@ public class CdnManager {
 
         @Override
         public @NotNull String getFileIdHex() {
-            return Utils.bytesToHex(fileId);
+            return file.getFileId();
+        }
+
+        @Override
+        public @NotNull SuperAudioFormat codec() {
+            return file.getFormat();
         }
 
         private void requestChunk(int index) {
@@ -224,85 +246,33 @@ public class CdnManager {
                 if (cacheHandler != null && cacheHandler.hasChunk(index)) {
                     cacheHandler.readChunk(index, this);
                 } else {
-                    CdnLoader.Response resp = loader.request(index);
+                    InternalResponse resp = request(index);
                     writeChunk(resp.buffer, index, false);
                 }
-            } catch (SQLException | IOException | CdnException ex) {
+            } catch (SQLException | IOException ex) {
                 LOGGER.fatal(String.format("Failed requesting chunk, index: %d", index), ex);
             }
         }
 
-        private static class CdnLoader {
-            private final AudioUrl moreAudio;
-            private Socket socket;
-            private DataInputStream in;
-            private OutputStream out;
+        @NotNull
+        public synchronized InternalResponse request(int chunk) throws IOException {
+            return request(CHUNK_SIZE * chunk, (chunk + 1) * CHUNK_SIZE - 1);
+        }
 
-            CdnLoader(@NotNull AudioUrl moreAudio) throws IOException {
-                this.moreAudio = moreAudio;
+        @NotNull
+        public synchronized InternalResponse request(int rangeStart, int rangeEnd) throws IOException {
+            try (Response resp = client.newCall(new Request.Builder().get().url(cdnUrl)
+                    .header("Range", "bytes=" + rangeStart + "-" + rangeEnd)
+                    .build()).execute()) {
 
-                populateSocket();
-            }
+                if (resp.code() != 206)
+                    throw new IOException(resp.code() + ": " + resp.message());
 
-            private synchronized void populateSocket() throws IOException {
-                this.socket = moreAudio.createSocket();
-                this.in = new DataInputStream(socket.getInputStream());
-                this.out = socket.getOutputStream();
-            }
+                ResponseBody body = resp.body();
+                if (body == null)
+                    throw new IOException("Response body is empty!");
 
-            @NotNull
-            public synchronized Response request(int chunk) throws IOException, CdnException {
-                return request(CHUNK_SIZE * chunk, (chunk + 1) * CHUNK_SIZE - 1, false);
-            }
-
-            @NotNull
-            public synchronized Response request(int rangeStart, int rangeEnd, boolean retried) throws IOException, CdnException {
-                try {
-                    if (socket == null || socket.isClosed())
-                        populateSocket();
-
-                    moreAudio.sendRequest(out, rangeStart, rangeEnd);
-
-                    NetUtils.StatusLine sl = NetUtils.parseStatusLine(Utils.readLine(in));
-                    if (sl.statusCode == 408) {
-                        socket.close();
-                        return request(rangeStart, rangeEnd, false);
-                    } else if (sl.statusCode != 206) {
-                        throw new IOException(sl.statusCode + ": " + sl.statusPhrase);
-                    }
-
-                    Map<String, String> headers = NetUtils.parseHeaders(in);
-                    String contentLengthStr = headers.get("Content-Length");
-                    if (contentLengthStr == null)
-                        throw new CdnException("Missing Content-Length header!");
-
-                    int contentLength = Integer.parseInt(contentLengthStr);
-                    byte[] buffer = new byte[contentLength];
-                    in.readFully(buffer);
-
-                    String connectionStr = headers.get("Connection");
-                    if (Objects.equals(connectionStr, "close"))
-                        socket.close();
-
-                    return new Response(buffer, headers);
-                } catch (IOException ex) {
-                    if (!retried) {
-                        if (socket != null) socket.close();
-                        return request(rangeStart, rangeEnd, true);
-                    } else {
-                        throw ex;
-                    }
-                }
-            }
-
-            private static class Response {
-                private final byte[] buffer;
-                private final Map<String, String> headers;
-
-                Response(byte[] buffer, Map<String, String> headers) {
-                    this.buffer = buffer;
-                    this.headers = headers;
-                }
+                return new InternalResponse(body.bytes(), resp.headers());
             }
         }
 
